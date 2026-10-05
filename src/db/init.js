@@ -178,6 +178,50 @@ function runMigrations(db) {
     revoked_at TEXT, views INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_bill_links_resident ON bill_links(resident_id)');
 
+  // ── Super-admin: SaaS plans, subscription payments, content, admin audit (additive) ──
+  const saasCols = {
+    accounts: [['plan_id', 'TEXT'], ['paid_until', 'TEXT'], ['admin_notes', 'TEXT']],
+    users: [['last_login_at', 'TEXT']],
+  };
+  for (const [table, list] of Object.entries(saasCols)) {
+    const have = getColumns(table);
+    if (!have.length) continue;
+    for (const [col, type] of list) {
+      if (!have.includes(col)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+        console.log(`[MIGRATION] Added ${table}.${col}`);
+      }
+    }
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS saas_plans (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+    price_paise INTEGER NOT NULL DEFAULT 0 CHECK (price_paise >= 0),
+    duration_days INTEGER NOT NULL DEFAULT 30 CHECK (duration_days BETWEEN 1 AND 3660),
+    max_beds INTEGER, description TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+  // No foreign keys on purpose: revenue history stays even if a customer account is deleted.
+  db.exec(`CREATE TABLE IF NOT EXISTS subscription_payments (
+    id TEXT PRIMARY KEY, account_id TEXT NOT NULL, business_name TEXT,
+    plan_id TEXT, plan_name TEXT, invoice_no TEXT NOT NULL UNIQUE,
+    amount_paise INTEGER NOT NULL CHECK (amount_paise >= 0),
+    mode TEXT NOT NULL, reference TEXT, paid_on TEXT NOT NULL,
+    period_start TEXT NOT NULL, period_end TEXT NOT NULL, notes TEXT,
+    status TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('paid','void')),
+    void_reason TEXT, voided_at TEXT, voided_by TEXT, created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_subpay_account ON subscription_payments(account_id, paid_on)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_subpay_paid_on ON subscription_payments(paid_on)');
+  db.exec(`CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS admin_audit (
+    id TEXT PRIMARY KEY, actor_id TEXT, actor_name TEXT, action TEXT NOT NULL,
+    target_type TEXT, target_id TEXT, details TEXT, ip TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit(created_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)');
+
   // Ledger + reports (additive, idempotent). Loaded lazily so a problem in the
   // ledger can never stop the rest of the app from booting.
   try {
