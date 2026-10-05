@@ -6,6 +6,10 @@
     "androidScheme": "https",
     "url": "https://dormbook-tested-production.up.railway.app",
     "cleartext": false,
-    "errorPath": "offline.html"
+    "errorPath": "offline.html",
+    "allowNavigation": [
+      "*.onrender.com",
+      "*.up.railway.app"
+    ]
   }
 }
