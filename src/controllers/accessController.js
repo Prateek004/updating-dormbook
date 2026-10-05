@@ -100,7 +100,7 @@ function setMpin(req, res) {
   const problem = mpinProblem(mpin, user.mobile);
   if (problem) return res.status(400).json({ error: problem, code: 'BAD_MPIN' });
   const blocked = accountBlock(db, user);
-  if (blocked) return res.status(403).json({ error: blocked });
+  if (blocked) return res.status(403).json({ error: blocked, code: 'ACCOUNT_BLOCKED' });
 
   const now = new Date(Math.floor(Date.now() / 1000) * 1000).toISOString();
   db.transaction(() => {
