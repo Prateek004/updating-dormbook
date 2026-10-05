@@ -32,6 +32,21 @@ function makeToken(user) {
   );
 }
 
+/** Plan / trial facts the app shows the owner (banner, "choose a plan"). Never blocks anything. */
+function accountInfo(user) {
+  if (!user || user.role === 'superadmin' || !user.account_id) return null;
+  try {
+    const db = getDb();
+    const a = db.prepare('SELECT * FROM accounts WHERE id = ?').get(user.account_id);
+    if (!a) return null;
+    const st = require('../services/accountStatus').accountState(a);
+    let planName = null;
+    try { planName = a.plan_id ? (db.prepare('SELECT name FROM saas_plans WHERE id = ?').get(a.plan_id) || {}).name || null : null; } catch (_) { /* table added at boot */ }
+    return { business_name: a.business_name, status: st.status, days_left: st.days_left,
+      trial_ends_at: a.trial_ends_at || null, paid_until: a.paid_until || null, plan_name: planName };
+  } catch (_) { return null; }
+}
+
 function publicUser(user) {
   return {
     id:          user.id,
@@ -43,6 +58,7 @@ function publicUser(user) {
     account_id:  user.account_id,
     has_mpin:    !!user.mpin_hash,
     permissions: effectivePermissions(user),   // what this user may do (drives the menu)
+    account:     accountInfo(user),            // trial / plan status for the banner
   };
 }
 
@@ -50,10 +66,7 @@ function publicUser(user) {
 function accountBlock(db, user) {
   if (user.role === 'superadmin' || !user.account_id) return null;
   const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(user.account_id);
-  if (!account) return null;
-  if (account.suspended_at) return 'Account suspended. Contact support.';
-  if (account.plan === 'trial' && account.trial_ends_at < new Date().toISOString()) return 'Trial expired. Contact support to continue.';
-  return null;
+  return require('../services/accountStatus').accountProblem(account);
 }
 
 const str = (v) => (typeof v === 'string' || typeof v === 'number' ? String(v) : '');
@@ -126,47 +139,47 @@ function login(req, res) {
   }
 
   const blocked = accountBlock(db, user);
-  if (blocked) return res.status(403).json({ error: blocked });
+  if (blocked) return res.status(403).json({ error: blocked, code: 'ACCOUNT_BLOCKED' });
 
   clearFailures(db, user);
+  try { db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(new Date().toISOString(), user.id); }
+  catch (_) { /* column added at boot; never block a sign-in over it */ }
   return res.json({ token: makeToken(user), user: publicUser(user) });
 }
 
-/** POST /api/v1/auth/register — self-serve signup */
-function register(req, res) {
-  const b = req.body || {};
-  const business_name = str(b.business_name).trim().slice(0, 120);
-  const owner_name = str(b.owner_name).trim().slice(0, 120);
-  const password = str(b.password);
-  const email = str(b.email).toLowerCase().trim().slice(0, 120);
-  const pg_name = str(b.pg_name).trim().slice(0, 120);
-  const city = str(b.city).trim().slice(0, 60);
+/** Is password reset by OTP (WhatsApp / SMS) switched on? Off unless OTP_ENABLED=true. */
+function otpEnabled() { return process.env.OTP_ENABLED === 'true'; }
+const OTP_OFF = 'Password reset by OTP is switched off. Ask DormBook support to reset your password.';
 
-  if (!business_name || !owner_name || !b.mobile || !password) {
-    return res.status(400).json({ error: 'business_name, owner_name, mobile, and password are required' });
+/**
+ * Make a new business: account + first property + owner login, all or nothing.
+ * Used by self sign-up and by the super-admin "Add customer" screen.
+ * Returns { userId, accountId, propertyId } or throws { status, message }.
+ */
+function createCustomer(db, f) {
+  const fail = (status, message) => { throw Object.assign(new Error(message), { status, expose: true }); };
+  const business_name = str(f.business_name).trim().slice(0, 120);
+  const owner_name = str(f.owner_name).trim().slice(0, 120);
+  const password = str(f.password);
+  const email = str(f.email).toLowerCase().trim().slice(0, 120);
+  const pg_name = str(f.pg_name).trim().slice(0, 120);
+  const city = str(f.city).trim().slice(0, 60);
+  if (!business_name || !owner_name || !f.mobile || !password) {
+    fail(400, 'business_name, owner_name, mobile, and password are required');
   }
-  if (password.length < 8 || password.length > 200) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters' });
-  }
-  const mobileTrim = str(b.mobile).replace(/\D/g, '');
-  if (mobileTrim.length < 10 || mobileTrim.length > 13) {
-    return res.status(400).json({ error: 'Invalid mobile number' });
-  }
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Email is not valid' });
+  if (password.length < 8 || password.length > 200) fail(400, 'Password must be at least 8 characters');
+  const mobileTrim = str(f.mobile).replace(/\D/g, '');
+  if (mobileTrim.length < 10 || mobileTrim.length > 13) fail(400, 'Invalid mobile number');
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, 'Email is not valid');
+  if (db.prepare('SELECT id FROM users WHERE mobile = ?').get(mobileTrim)) fail(409, 'Mobile number already registered');
+  if (email && db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email)) fail(409, 'Email already registered');
 
-  const db = getDb();
-
-  // Check mobile uniqueness
-  const existing = db.prepare('SELECT id FROM users WHERE mobile = ?').get(mobileTrim);
-  if (existing) {
-    return res.status(409).json({ error: 'Mobile number already registered' });
-  }
-
+  const trialDays = Number.isInteger(f.trial_days) && f.trial_days >= 1 && f.trial_days <= 3650 ? f.trial_days : 30;
   const accountId  = uuidv4();
   const propertyId = uuidv4();
   const userId     = uuidv4();
   const now        = new Date().toISOString();
-  const trialEnds  = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const trialEnds  = new Date(Date.now() + trialDays * 24 * 60 * 60 * 1000).toISOString();
   const hash       = bcrypt.hashSync(password, BCRYPT_ROUNDS);
 
   try {
@@ -191,19 +204,31 @@ function register(req, res) {
       `).run(userId, accountId, propertyId, owner_name, email || null, mobileTrim, hash, now);
     })();
   } catch (err) {
-    if (err.message && err.message.includes('UNIQUE')) {
-      return res.status(409).json({ error: 'Email or mobile already registered' });
-    }
-    console.error('[AUTH] register tx failed:', err.message);
-    return res.status(500).json({ error: 'Registration failed — please try again' });
+    if (err.message && err.message.includes('UNIQUE')) fail(409, 'Email or mobile already registered');
+    console.error('[AUTH] create customer failed:', err.message);
+    fail(500, 'Registration failed — please try again');
   }
+  return { userId, accountId, propertyId };
+}
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+/** POST /api/v1/auth/register — self-serve signup */
+function register(req, res) {
+  const db = getDb();
+  let made;
+  try {
+    // Self sign-up always gets the standard 30-day trial (trial_days is only for the super-admin).
+    made = createCustomer(db, { ...(req.body || {}), trial_days: undefined });
+  } catch (e) {
+    if (e.expose) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(made.userId);
   return res.status(201).json({ token: makeToken(user), user: publicUser(user) });
 }
 
 /** POST /api/v1/auth/forgot-password */
 async function forgotPassword(req, res) {
+  if (!otpEnabled()) return res.status(410).json({ error: OTP_OFF, code: 'OTP_OFF' });
   // Always returns 200 — prevents mobile enumeration
   const mobileTrim = str((req.body || {}).mobile).replace(/\D/g, '');
   if (!/^\d{10,13}$/.test(mobileTrim)) return res.json({ ok: true });
@@ -245,6 +270,7 @@ async function forgotPassword(req, res) {
 
 /** POST /api/v1/auth/reset-password */
 function resetPassword(req, res) {
+  if (!otpEnabled()) return res.status(410).json({ error: OTP_OFF, code: 'OTP_OFF' });
   const b = req.body || {};
   const mobile = str(b.mobile), otp = str(b.otp), new_password = str(b.new_password);
   if (!mobile || !otp || !new_password) {
@@ -327,4 +353,5 @@ function me(req, res) {
 module.exports = {
   login, register, forgotPassword, resetPassword, changePassword, me,
   makeToken, publicUser, accountBlock, recordFailure, waitingMessage, clearFailures,
+  createCustomer, otpEnabled,
 };
