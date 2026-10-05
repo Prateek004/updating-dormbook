@@ -1,5 +1,5 @@
 /**
- * DormBook Service Worker — v4.1
+ * DormBook Service Worker — v4.2
  * Implements:
  *   - Network-first for app files (offline fallback from cache)
  *   - API calls never cached; writes are never queued offline
@@ -7,7 +7,7 @@
  * IMPORTANT: Bump CACHE_VERSION on every deploy that changes static files.
  */
 
-const CACHE_VERSION   = 'dormbook-v4.8';
+const CACHE_VERSION   = 'dormbook-v4.9';
 const STATIC_CACHE    = `${CACHE_VERSION}-static`;
 
 const STATIC_ASSETS = [
@@ -15,6 +15,9 @@ const STATIC_ASSETS = [
   '/index.html',
   '/css/app.css',
   '/js/app.js',
+  '/js/live.js',
+  '/js/admin.js',
+  '/brand/logo',
   '/manifest.json',
 ];
 
@@ -42,6 +45,10 @@ self.addEventListener('activate', event => {
 // ── Fetch: routing strategy ────────────────────────────────────────────────
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
+
+  // Live-update stream: let the browser handle it directly (a long-lived stream must not
+  // pass through the service worker).
+  if (url.pathname === '/api/v1/events') return;
 
   // API calls: always go to the server. Responses are never cached — they hold
   // private data, and a stale copy could show another user's (or a deleted
