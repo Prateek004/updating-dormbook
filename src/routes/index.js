@@ -27,13 +27,17 @@ const share      = require('../controllers/shareController');
 const accounts   = require('../controllers/accountsController');
 const payroll    = require('../controllers/payrollController');
 const purchases  = require('../controllers/purchasesController');
+const sa         = require('../controllers/superadminController');
+const pub        = require('../controllers/publicController');
+const live       = require('../controllers/liveController');
+const { adminWrite, adminExport } = require('../middleware/rateLimits');
 const { can }    = require('../middleware/permissions');
 const { safeEqual } = require('../util/security');
 
 // Every request: strict shape checks, and exact schemas for the sign-in routes.
 const { validateRequest, checkParam } = require('../middleware/validate');
 router.use(validateRequest);
-for (const p of ['id', 'docId', 'receipt_number', 'type']) router.param(p, checkParam);
+for (const p of ['id', 'docId', 'receipt_number', 'type', 'key']) router.param(p, checkParam);
 
 // Async handlers: send any error to the error handler instead of leaving the request hanging.
 const aw = (fn) => (req, res, next) => { try { Promise.resolve(fn(req, res, next)).catch(next); } catch (e) { next(e); } };
@@ -50,7 +54,17 @@ router.post('/auth/staff/request-code', aw(access.requestCode));
 router.post('/auth/staff/set-mpin',     access.setMpin);
 router.post('/auth/change-mpin',        authenticate, access.changeMpin);
 
+// ── Public app shell (no sign-in): name, logo, support, plans ──
+router.get('/public/config', pub.config);
+
+// ── Live updates (signed-in phones refresh when data changes) ──
+router.post('/events/ticket', authenticate, live.ticket);
+router.get ('/events',        live.stream);
+
 // ── Super-admin ───────────────────────────────────────────
+// Every /admin route: signed in + super-admin. Writes have their own rate limit.
+const SA = [authenticate, requireSuperAdmin];
+const SAW = [authenticate, requireSuperAdmin, adminWrite];
 router.get  ('/admin/stats',                  authenticate, requireSuperAdmin, admin.adminStats);
 router.get  ('/admin/accounts',               authenticate, requireSuperAdmin, admin.listAccounts);
 router.get  ('/admin/accounts/:id',           authenticate, requireSuperAdmin, admin.getAccount);
@@ -58,8 +72,47 @@ router.patch('/admin/accounts/:id/suspend',   authenticate, requireSuperAdmin, a
 router.patch('/admin/accounts/:id/activate',  authenticate, requireSuperAdmin, admin.activateAccount);
 router.post  ('/admin/accounts/:id/reset-password', authenticate, requireSuperAdmin, admin.resetOwnerPassword);
 router.delete('/admin/accounts/:id',                authenticate, requireSuperAdmin, admin.deleteAccount);
+router.patch ('/admin/accounts/:id/unsuspend',      ...SAW, admin.unsuspendAccount);
+router.post  ('/admin/accounts',                    ...SAW, sa.createAccount);
+router.patch ('/admin/accounts/:id',                ...SAW, sa.updateAccount);
+router.post  ('/admin/accounts/:id/extend-trial',   ...SAW, sa.extendTrial);
+router.get   ('/admin/overview',                    ...SA,  sa.overview);
+// Users (owners + staff of every customer)
+router.get   ('/admin/users',                       ...SA,  sa.listUsers);
+router.patch ('/admin/users/:id',                   ...SAW, sa.updateUser);
+router.post  ('/admin/users/:id/reset-password',    ...SAW, sa.resetUserPassword);
+router.post  ('/admin/users/:id/unlock',            ...SAW, sa.unlockUser);
+router.delete('/admin/users/:id',                   ...SAW, sa.deleteUser);
+// Super-admin logins
+router.get   ('/admin/admins',                      ...SA,  sa.listAdmins);
+router.post  ('/admin/admins',                      ...SAW, sa.createAdmin);
+router.patch ('/admin/admins/:id',                  ...SAW, sa.updateAdmin);
+router.delete('/admin/admins/:id',                  ...SAW, sa.deleteAdmin);
+// Plans & pricing
+router.get   ('/admin/plans',                       ...SA,  sa.listPlans);
+router.post  ('/admin/plans',                       ...SAW, sa.createPlan);
+router.patch ('/admin/plans/:id',                   ...SAW, sa.updatePlan);
+router.delete('/admin/plans/:id',                   ...SAW, sa.deletePlan);
+// Subscription payments (what PG owners pay for DormBook)
+router.get   ('/admin/payments',                    ...SA,  sa.listPayments);
+router.post  ('/admin/payments',                    ...SAW, sa.createPayment);
+router.get   ('/admin/payments/:id',                ...SA,  sa.getPayment);
+router.patch ('/admin/payments/:id',                ...SAW, sa.updatePayment);
+router.post  ('/admin/payments/:id/void',           ...SAW, sa.voidPayment);
+// Content: branding, support, FAQ
+router.get   ('/admin/content',                     ...SA,  sa.getContent);
+router.put   ('/admin/content/:key',                ...SAW, sa.putContent);
+// Reports
+router.get   ('/admin/reports',                     ...SA,  sa.reports);
+router.get   ('/admin/reports/export',              ...SA,  adminExport, sa.exportReport);
+// System: health, backups (disk + R2)
+router.get   ('/admin/system',                      ...SA,  aw(sa.system));
+router.post  ('/admin/system/backup',               ...SAW, aw(sa.backupNow));
+router.post  ('/admin/system/sync-uploads',         ...SAW, aw(sa.syncUploads));
+router.get   ('/admin/audit',                       ...SA,  sa.audit);
 // ── Dashboard ─────────────────────────────────────────────
 router.get('/dashboard/summary', authenticate, sameProperty, finance.getDashboard);
+router.get('/onboarding',        authenticate, sameProperty, require('../controllers/onboardingController').onboarding);
 
 // ── Property Setup (floors, rooms) ────────────────────────
 router.get  ('/floors',          authenticate, sameProperty, beds.listFloors);
@@ -93,7 +146,7 @@ router.patch('/residents/:id/rent',              authenticate, sameProperty, can
 // ── Resident ID documents ─────────────────────────────────
 router.post  ('/residents/:id/documents',        authenticate, sameProperty, can('checkin', 'view_id_docs'), assertOwnsResource('residents'), docs.uploadDocument);
 router.get   ('/residents/:id/documents',        authenticate, sameProperty, assertOwnsResource('residents'), docs.listDocuments);
-router.get   ('/residents/:id/documents/:docId', authenticate, sameProperty, can('view_id_docs'), assertOwnsResource('residents'), docs.getDocument);
+router.get   ('/residents/:id/documents/:docId', authenticate, sameProperty, can('view_id_docs'), assertOwnsResource('residents'), aw(docs.getDocument));
 router.delete('/residents/:id/documents/:docId', authenticate, sameProperty, can('view_id_docs'), assertOwnsResource('residents'), docs.deleteDocument);
 
 // ── Resident ledger & refund ──────────────────────────────
@@ -235,6 +288,15 @@ function verifyWebhookSecret(req, res, next) {
   next();
 }
 
-router.get('/health', (req, res) => res.json({ status: 'ok', version: '4.0.0', timestamp: new Date().toISOString() }));
+// Health check (Render / Railway call this). 503 when the database cannot answer, so the
+// platform restarts a broken instance instead of sending users to it.
+router.get('/health', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  let db = 'ok';
+  try { require('../db/connection').getDb().prepare('SELECT 1').get(); } catch (e) { db = 'down'; }
+  const body = { status: db === 'ok' ? 'ok' : 'degraded', db, version: require('../services/realtime').getVersion(),
+    uptime_s: Math.round(process.uptime()), timestamp: new Date().toISOString() };
+  res.status(db === 'ok' ? 200 : 503).json(body);
+});
 
 module.exports = router;
