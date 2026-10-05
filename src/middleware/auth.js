@@ -2,14 +2,13 @@
 
 const jwt    = require('jsonwebtoken');
 const { getDb } = require('../db/connection');
+const { accountProblem } = require('../services/accountStatus');
 
 function getJwtSecret() {
   const s = process.env.JWT_SECRET;
   if (!s || s.startsWith('CHANGE_ME')) {
     // The test-only secret below must never sign real logins: refuse it on any real server.
-    const deployed = process.env.NODE_ENV === 'production'
-      || !!(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID);
-    if (deployed) {
+    if (require('../util/env').isDeployed()) {
       throw new Error('JWT_SECRET is not configured');
     }
     return 'change_this_secret_dev_only_32chars!';
@@ -45,15 +44,9 @@ function authenticate(req, res, next) {
 
     // Superadmin bypasses all account/plan enforcement
     if (user.role !== 'superadmin' && user.account_id) {
-      const account = db.prepare('SELECT plan, trial_ends_at, suspended_at FROM accounts WHERE id = ?').get(user.account_id);
-      if (account) {
-        if (account.suspended_at) {
-          return res.status(403).json({ error: 'Account suspended. Contact support.' });
-        }
-        if (account.plan === 'trial' && account.trial_ends_at < new Date().toISOString()) {
-          return res.status(403).json({ error: 'Trial expired. Contact support to continue.' });
-        }
-      }
+      const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(user.account_id);
+      const problem = accountProblem(account);
+      if (problem) return res.status(403).json({ error: problem, code: 'ACCOUNT_BLOCKED' });
     }
 
     req.user = {
@@ -65,7 +58,13 @@ function authenticate(req, res, next) {
     };
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    // A bad / expired token signs the user out. Any OTHER error (database busy, disk hiccup)
+    // must NOT sign everyone out — answer "try again" instead.
+    if (err && /^(JsonWebTokenError|TokenExpiredError|NotBeforeError)$/.test(err.name)) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    console.error('[AUTH] could not check session:', err && err.message);
+    return res.status(503).json({ error: 'Server busy — please try again' });
   }
 }
 
