@@ -11,6 +11,9 @@
  */
 
 function isConfigured() {
+  // OTP / SMS codes are switched off for now: nothing is sent unless OTP_ENABLED=true.
+  // (Owners still see each staff login code on screen and can share it on WhatsApp.)
+  if (process.env.OTP_ENABLED !== 'true') return false;
   return !!(process.env.MSG91_AUTH_KEY && process.env.MSG91_OTP_TEMPLATE_ID) && process.env.NODE_ENV !== 'test';
 }
 
