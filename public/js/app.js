@@ -47,6 +47,31 @@ window.addEventListener('offline', () => document.getElementById('offline-indica
 // ── State ────────────────────────────────────────────────────
 const STATE = { token: null, user: null, currentPage: null };
 
+// ── Sign-in storage: this tab only (default on a website), or "Keep me signed in on this
+// phone" (default in the app). The session itself still ends when the token expires. ──
+const SESSION = {
+  keep() { try { return localStorage.getItem('db_keep') === '1'; } catch (_) { return false; } },
+  setKeep(on) {
+    try {
+      if (on) localStorage.setItem('db_keep', '1');
+      else { localStorage.removeItem('db_keep'); localStorage.removeItem('db_token'); localStorage.removeItem('db_user'); }
+    } catch (_) { /* private mode: this tab only */ }
+  },
+  get(k) {
+    try { return sessionStorage.getItem(k) || (SESSION.keep() ? localStorage.getItem(k) : null); } catch (_) { return null; }
+  },
+  set(k, v) {
+    try { sessionStorage.setItem(k, v); } catch (_) { /* ignore */ }
+    try { if (SESSION.keep()) localStorage.setItem(k, v); } catch (_) { /* ignore */ }
+  },
+  clear() {
+    for (const k of ['db_token', 'db_user']) {
+      try { sessionStorage.removeItem(k); } catch (_) { /* ignore */ }
+      try { localStorage.removeItem(k); } catch (_) { /* ignore */ }
+    }
+  },
+};
+
 // ── API helper ───────────────────────────────────────────────
 function newIdemKey() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -65,13 +90,27 @@ async function api(method, path, body) {
     ...(body ? { body: JSON.stringify(body) } : {}),
   };
   const res = await fetch(`/api/v1${path}`, opts);
+  // Live updates (live.js): which app version the server runs, and "this phone just saved something".
+  try {
+    if (typeof onServerVersion === 'function') onServerVersion(res.headers.get('X-App-Version'));
+    if (method !== 'GET' && res.ok && typeof onLocalWrite === 'function') onLocalWrite();
+  } catch (_) { /* never let this break a request */ }
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && STATE.token && !path.startsWith('/auth/login')) {
     // Session no longer valid (expired, server secret changed, or database reset).
-    sessionStorage.clear();
+    if (typeof liveStop === 'function') liveStop();
+    SESSION.clear();
     STATE.token = null; STATE.user = null;
     showScreen('login-screen');
     toast('Your session has ended — please sign in again', 'warning', 5000);
+  }
+  // Trial ended / subscription ended / suspended while using the app → sign-in screen with the reason and how to renew.
+  if (res.status === 403 && data && data.code === 'ACCOUNT_BLOCKED' && STATE.token) {
+    if (typeof liveStop === 'function') liveStop();
+    SESSION.clear();
+    STATE.token = null; STATE.user = null;
+    showScreen('login-screen');
+    showBlocked(data.error);
   }
   if (!res.ok) {
     const msg = data.error || (res.status >= 500 ? 'Server is not reachable right now. Please try again in a minute.' : `Request failed (${res.status})`);
@@ -113,7 +152,12 @@ function openModal(title, bodyHtml, { wide } = {}) {
   document.getElementById('modal').style.maxWidth = wide ? '720px' : '520px';
   document.getElementById('modal-overlay').classList.remove('hidden');
 }
-function closeModal() { document.getElementById('modal-overlay').classList.add('hidden'); }
+function closeModal() {
+  const o = document.getElementById('modal-overlay');
+  const wasOpen = o && !o.classList.contains('hidden');
+  o.classList.add('hidden');
+  if (wasOpen && typeof onModalClosed === 'function') { try { onModalClosed(); } catch (_) { /* ignore */ } }
+}
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modal-close').addEventListener('click', closeModal);
   document.getElementById('modal-overlay').addEventListener('click', e => { if (e.target === document.getElementById('modal-overlay')) closeModal(); });
@@ -395,6 +439,7 @@ function titleFor(page) {
     audit: 'Audit Log', acc_entries: 'Record money', acc_daybook: 'Day Book', acc_ledger: 'Ledgers', acc_tb: 'Trial Balance',
     acc_pl: 'Profit & Loss', acc_bs: 'Balance Sheet', purchases: 'Purchases', salary: 'Staff Salary', feedback: 'Tenant Feedback', admin: 'Admin Panel', account: 'My Account' };
   if (map[page]) return map[page];
+  if (typeof ADMIN_TITLES !== 'undefined' && ADMIN_TITLES[page]) return ADMIN_TITLES[page];
   const g = PAGES.find(p => p.id === page && p.title);
   return g ? g.title : page;
 }
@@ -405,7 +450,7 @@ function closeSidebar() { document.getElementById('sidebar').classList.remove('o
 
 // ── Screen helper ────────────────────────────────────────────
 function showScreen(id) {
-  ['login-screen', 'register-screen', 'forgot-screen', 'mpin-screen', 'main-app', 'loading-screen'].forEach(s => {
+  ['login-screen', 'register-screen', 'mpin-screen', 'main-app', 'loading-screen'].forEach(s => {
     const el = document.getElementById(s);
     if (el) el.classList.add('hidden');
   });
@@ -414,21 +459,54 @@ function showScreen(id) {
 }
 
 // ── Auth ─────────────────────────────────────────────────────
+// ── App name, logo, support contact (set by the super-admin) ──────
+window.APP_CONFIG = null;
+async function loadAppConfig(force) {
+  try {
+    if (window.APP_CONFIG && !force) return window.APP_CONFIG;
+    const res = await fetch('/api/v1/public/config', { cache: force ? 'no-store' : 'default' });
+    if (!res.ok) return null;
+    const c = await res.json();
+    window.APP_CONFIG = c;
+    applyBranding(c);
+    return c;
+  } catch (_) { return null; }   // offline: the built-in name and logo stay
+}
+function applyBranding(c) {
+  const b = (c && c.branding) || {};
+  const name = b.app_name || 'DormBook';
+  document.title = name;
+  document.querySelectorAll('.brand-name').forEach(el => { el.textContent = name; });
+  document.querySelectorAll('.brand-tagline').forEach(el => { el.textContent = b.tagline || ''; });
+  if (b.logo_url) document.querySelectorAll('img.brand-logo').forEach(img => { if (img.getAttribute('src') !== b.logo_url) img.src = b.logo_url; });
+  const s = (c && c.support) || {};
+  const box = document.getElementById('support-line');
+  if (box) {
+    const links = [];
+    if (s.whatsapp) links.push(`<a href="https://wa.me/${h(s.whatsapp)}?text=${encodeURIComponent('Hello, I need help signing in to ' + name)}" target="_blank" rel="noopener">WhatsApp</a>`);
+    if (s.phone) links.push(`<a href="tel:${h(s.phone)}">${h(s.phone)}</a>`);
+    if (s.email) links.push(`<a href="mailto:${h(s.email)}">${h(s.email)}</a>`);
+    box.innerHTML = `Forgot password? Contact ${h(name)} support${links.length ? `: ${links.join(' · ')}` : '.'}${s.hours ? `<br><span class="td-small">${h(s.hours)}</span>` : ''}`;
+  }
+}
+
 async function init() {
   const loadingTimer = setTimeout(() => showScreen('login-screen'), 4000);
+  loadAppConfig();
   try {
-    const token = sessionStorage.getItem('db_token');
-    const user  = JSON.parse(sessionStorage.getItem('db_user') || 'null');
+    const token = SESSION.get('db_token');
+    let user = null;
+    try { user = JSON.parse(SESSION.get('db_user') || 'null'); } catch (_) { user = null; }
     if (token && user) {
       STATE.token = token;
       STATE.user  = user;
       try {
         const me = await api('GET', '/auth/me');
-        if (me && me.user) { STATE.user = me.user; sessionStorage.setItem('db_user', JSON.stringify(me.user)); } // fresh permissions
+        if (me && me.user) { STATE.user = me.user; SESSION.set('db_user', JSON.stringify(me.user)); } // fresh permissions
         clearTimeout(loadingTimer);
         showApp();
       } catch {
-        sessionStorage.clear();
+        SESSION.clear();
         STATE.token = null;
         STATE.user  = null;
         clearTimeout(loadingTimer);
@@ -456,25 +534,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Screen navigation links
   document.getElementById('goto-register')?.addEventListener('click', e => { e.preventDefault(); showScreen('register-screen'); });
-  document.getElementById('goto-forgot')?.addEventListener('click',   e => { e.preventDefault(); showScreen('forgot-screen'); });
   document.getElementById('goto-login')?.addEventListener('click',    e => { e.preventDefault(); showScreen('login-screen'); });
-  document.getElementById('goto-login-2')?.addEventListener('click',  e => { e.preventDefault(); showScreen('login-screen'); });
 
   // Register form
   document.getElementById('register-btn')?.addEventListener('click', handleRegister);
   document.getElementById('register-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleRegister(e); });
 
-  // Forgot password — step 1 (send OTP)
-  document.getElementById('forgot-send-btn')?.addEventListener('click', handleForgotSend);
-
-  // Forgot password — step 2 (reset with OTP)
-  document.getElementById('forgot-reset-btn')?.addEventListener('click', handleForgotReset);
-
   // Staff: first time / forgot MPIN
   document.getElementById('goto-mpin')?.addEventListener('click', e => { e.preventDefault(); showMpinScreen(); });
   document.getElementById('goto-login-3')?.addEventListener('click', e => { e.preventDefault(); showScreen('login-screen'); });
   document.getElementById('mp-save')?.addEventListener('click', submitMpinSetup);
-  document.getElementById('mp-sms')?.addEventListener('click', e => { e.preventDefault(); requestMpinCode(); });
   document.getElementById('mpin-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitMpinSetup(); } });
 });
 
@@ -485,16 +554,27 @@ async function handleLogin(e) {
   err.classList.add('hidden');
   btn.disabled = true;
   btn.textContent = 'Signing in…';
+  hideBlocked();
   try {
     const data = await api('POST', '/auth/login', {
       email:    document.getElementById('login-email').value.trim(),
       password: document.getElementById('login-password').value,
     });
     document.getElementById('login-password').value = '';
+    const keep = document.getElementById('login-keep');
+    SESSION.setKeep(!!(keep && keep.checked));
     startSession(data);
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
   } catch (ex) {
-    const msg = ex.status === 0
-      ? 'Cannot reach server. Check your connection.'
+    if (ex.data && ex.data.code === 'ACCOUNT_BLOCKED') {
+      showBlocked(ex.message);
+      btn.disabled = false;
+      btn.textContent = 'Sign In';
+      return;
+    }
+    const msg = ex.status === 0 || ex instanceof TypeError
+      ? 'Cannot reach the server. Check your internet and try again.'
       : (ex.message || 'Login failed');
     err.textContent = msg;
     err.classList.remove('hidden');
@@ -522,8 +602,9 @@ async function handleRegister(e) {
     });
     STATE.token = data.token;
     STATE.user  = data.user;
-    sessionStorage.setItem('db_token', data.token);
-    sessionStorage.setItem('db_user',  JSON.stringify(data.user));
+    SESSION.setKeep(true);   // a new owner stays signed in on this device
+    SESSION.set('db_token', data.token);
+    SESSION.set('db_user', JSON.stringify(data.user));
     toast(`Welcome, ${h(data.user.name)}! Your 30-day trial has started.`, 'success', 6000);
     showApp();
   } catch (ex) {
@@ -534,57 +615,6 @@ async function handleRegister(e) {
   }
 }
 
-// forgot step state
-let _forgotMobile = '';
-
-async function handleForgotSend(e) {
-  e?.preventDefault();
-  const btn = document.getElementById('forgot-send-btn');
-  const err = document.getElementById('forgot-error');
-  err.classList.add('hidden');
-  const mobile = document.getElementById('forgot-mobile').value.trim();
-  if (!mobile) { err.textContent = 'Enter your registered mobile number'; err.classList.remove('hidden'); return; }
-  btn.disabled = true;
-  btn.textContent = 'Sending…';
-  try {
-    await api('POST', '/auth/forgot-password', { mobile });
-    _forgotMobile = mobile;
-    // Show step 2
-    document.getElementById('forgot-step-1').classList.add('hidden');
-    document.getElementById('forgot-step-2').classList.remove('hidden');
-    toast('OTP sent to your WhatsApp', 'success');
-  } catch (ex) {
-    err.textContent = ex.message || 'Failed to send OTP';
-    err.classList.remove('hidden');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Send OTP';
-  }
-}
-
-async function handleForgotReset(e) {
-  e?.preventDefault();
-  const btn = document.getElementById('forgot-reset-btn');
-  const err = document.getElementById('forgot-reset-error');
-  err.classList.add('hidden');
-  const otp      = document.getElementById('forgot-otp').value.trim();
-  const password = document.getElementById('forgot-new-password').value;
-  if (!otp || !password) { err.textContent = 'Enter OTP and new password'; err.classList.remove('hidden'); return; }
-  btn.disabled = true;
-  btn.textContent = 'Resetting…';
-  try {
-    await api('POST', '/auth/reset-password', { mobile: _forgotMobile, otp, new_password: password });
-    toast('Password reset! Please log in.', 'success');
-    showScreen('login-screen');
-  } catch (ex) {
-    err.textContent = ex.message || 'Reset failed';
-    err.classList.remove('hidden');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Reset Password';
-  }
-}
-
 function showApp() {
   showScreen('main-app');
   document.getElementById('user-badge').textContent = `${STATE.user.name} · ${STATE.user.role}`;
@@ -592,22 +622,20 @@ function showApp() {
   const logoutBtn = document.getElementById('logout-btn');
   const newLogout = logoutBtn.cloneNode(true);
   logoutBtn.parentNode.replaceChild(newLogout, logoutBtn);
-  newLogout.addEventListener('click', logout);
+  newLogout.addEventListener('click', () => { if (confirm('Sign out of DormBook on this device?')) logout(); });
 
-  document.getElementById('menu-toggle').addEventListener('click', () => {
-    document.getElementById('sidebar').classList.toggle('open');
-  });
+  const toggle = document.getElementById('menu-toggle');
+  if (!toggle.dataset.bound) {          // once only (signing out and in again must not add a second listener)
+    toggle.dataset.bound = '1';
+    toggle.addEventListener('click', () => { document.getElementById('sidebar').classList.toggle('open'); });
+  }
 
-  // Superadmin gets its own nav + page
+  // Superadmin gets its own nav + pages (public/js/admin.js)
   if (STATE.user.role === 'superadmin') {
-    document.getElementById('nav-list').innerHTML = `
-      <li><a href="#" data-page="admin" class="active">👑 Admin Panel</a></li>
-    `;
-    document.getElementById('nav-list').querySelector('[data-page=admin]').addEventListener('click', e => {
-      e.preventDefault(); navigate('admin'); closeSidebar();
-    });
+    if (typeof buildAdminNav === 'function') buildAdminNav();
     navigate('admin');
     if (!navigator.onLine) document.getElementById('offline-indicator')?.classList.remove('hidden');
+    if (typeof liveStart === 'function') liveStart();
     return;
   }
 
@@ -615,10 +643,12 @@ function showApp() {
   buildTabbar();
   navigate('dashboard');
   if (!navigator.onLine) document.getElementById('offline-indicator')?.classList.remove('hidden');
+  if (typeof liveStart === 'function') liveStart();   // other phones' changes appear here live
 }
 
 function logout() {
-  sessionStorage.clear();
+  if (typeof liveStop === 'function') liveStop();
+  SESSION.clear();
   STATE.token = null;
   STATE.user  = null;
   location.reload();
@@ -678,8 +708,9 @@ async function renderPage(page) {
       case 'acc_entries': case 'acc_daybook': case 'acc_ledger': case 'acc_tb': case 'acc_pl': case 'acc_bs':
         await renderAccounts(el, page); break;
       case 'account':   await renderAccount(el);   break;
-      case 'admin':     await renderAdminPanel(el); break;
-      default:          el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
+      default:
+        if (/^admin(_|$)/.test(page) && typeof renderAdminPage === 'function') { await renderAdminPage(el, page); break; }
+        el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
     }
   } catch (ex) {
     if (ex && ex.status === 401) return;   // already sent to the login screen
@@ -691,6 +722,7 @@ async function renderPage(page) {
 // ── Dashboard ────────────────────────────────────────────────
 async function renderDashboard(el) {
   const d = await api('GET', '/dashboard/today');
+  setTimeout(fillDashExtra, 0);   // plan banner + "Get started" checklist (owner), below fills in its own time
   const t = d.tasks;
   const b = d.beds;
   const occ = b.total ? Math.round((b.occupied * 100) / b.total) : 0;
@@ -702,6 +734,7 @@ async function renderDashboard(el) {
   const row = (main, sub, btn) => `<div class="task-row"><div><div class="td-name">${main}</div><div class="td-small">${sub}</div></div>${btn || ''}</div>`;
 
   el.innerHTML = `
+    <div id="dash-extra"></div>
     <div class="kpis">
       <div class="kpi"><span>Occupancy</span><strong>${occ}%</strong><em>${b.occupied} of ${b.total} beds</em></div>
       <div class="kpi"><span>Vacant beds</span><strong>${b.available}</strong><em>${b.reserved} on hold · ${b.cleaning} cleaning</em></div>
@@ -1087,7 +1120,17 @@ async function renderCheckin(el) {
   ]);
   const beds = [...avail, ...reserved];
   if (!beds.length) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div><p>No vacant beds right now.</p></div>`;
+    const all = await api('GET', '/beds').catch(() => []);
+    if (!Array.isArray(all) || !all.length) {
+      el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div><p><b>Add your beds first.</b></p>
+        <p class="mt-12">Check-in picks a free bed, so set up your floors and beds once.</p>
+        ${can('beds_setup') ? `<button class="btn btn-primary mt-12" onclick="navigate('beds')">🛏 Set up beds</button>` : '<p class="td-small mt-12">Ask the owner to add beds.</p>'}</div>`;
+    } else {
+      el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div><p><b>All ${all.length} beds are taken.</b></p>
+        <p class="mt-12">Check someone out, or mark a bed as cleaned, to free a bed.</p>
+        <div class="btn-group mt-12 center"><button class="btn btn-primary" onclick="navigate('residents')">👥 Guests</button>
+        ${can('beds_setup') ? `<button class="btn btn-outline" onclick="navigate('beds')">🛏 Beds</button>` : ''}</div></div>`;
+    }
     return;
   }
   window._bedRates = {};
@@ -2876,175 +2919,6 @@ async function renderAudit(el) {
   `;
 }
 
-// ── Admin Panel (superadmin only) ────────────────────────────
-async function renderAdminPanel(el) {
-  const [stats, accounts] = await Promise.all([
-    api('GET', '/admin/stats'),
-    api('GET', '/admin/accounts'),
-  ]);
-
-  el.innerHTML = `
-    <div class="stat-grid mb-20">
-      <div class="stat-card"><div class="stat-label">Total Accounts</div><div class="stat-value">${stats.total}</div></div>
-      <div class="stat-card warning"><div class="stat-label">On Trial</div><div class="stat-value">${stats.trial}</div></div>
-      <div class="stat-card success"><div class="stat-label">Active (Paid)</div><div class="stat-value">${stats.active}</div></div>
-      <div class="stat-card danger"><div class="stat-label">Suspended</div><div class="stat-value">${stats.suspended}</div></div>
-      <div class="stat-card"><div class="stat-label">Expired Trials</div><div class="stat-value">${stats.expired}</div></div>
-      <div class="stat-card accent"><div class="stat-label">Live Residents</div><div class="stat-value">${stats.residents}</div></div>
-    </div>
-    <div class="card table-wrap">
-      <strong>All Accounts</strong>
-      <div class="table-wrap mt-12">
-        <table>
-          <thead><tr>
-            <th>Business</th><th>Owner</th><th>Mobile</th><th>Plan</th>
-            <th>Trial Ends</th><th>Properties</th><th>Residents</th><th>Actions</th>
-          </tr></thead>
-          <tbody>
-            ${accounts.map(a => `
-              <tr>
-                <td><div class="td-name">${h(a.business_name)}</div></td>
-                <td>${h(a.owner_name || '—')}</td>
-                <td>${h(a.owner_mobile || '—')}</td>
-                <td>
-                  <span class="badge ${a.plan==='active'?'badge-success':a.plan==='trial'?'badge-warning':'badge-danger'}">
-                    ${a.plan}
-                  </span>
-                </td>
-                <td>${fmtDate(a.trial_ends_at)}</td>
-                <td>${a.properties}</td>
-                <td>${a.residents}</td>
-                  <td>
-                  <button class="btn btn-primary btn-sm" onclick="adminViewAccount('${esc(a.id)}')">👁 View</button>
-                  ${a.plan !== 'active' ? `<button class="btn btn-success btn-sm" onclick="adminActivate('${a.id}')">Activate</button>` : ''}
-                  ${a.plan !== 'suspended' ? `<button class="btn btn-danger btn-sm" onclick="adminSuspend('${a.id}')">Suspend</button>` : ''}
-                  <button class="btn btn-outline btn-sm" onclick="adminResetPassword('${a.id}','${esc(a.owner_name || '')}')">Reset password</button>
-                  <button class="btn btn-danger btn-sm" onclick="adminDeleteUser('${a.id}','${esc(a.owner_name || '')}','${esc(a.business_name || '')}')">🗑 Delete</button>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  `;
-}
-
-/** Super-admin: one customer's overview — business facts and counts only (no guest or money details). */
-async function adminViewAccount(id) {
-  try {
-    const a = await api('GET', `/admin/accounts/${encodeURIComponent(id)}`);
-    const statusText = { trial: 'On trial', active: 'Active (paid)', suspended: 'Suspended', trial_expired: 'Trial expired' }[a.status] || a.status;
-    const roleName = { owner: 'Owner', manager: 'Manager', reception: 'Reception' };
-    const yes = (b) => (b ? '✅ Yes' : '— No');
-    const props = (a.properties || []).map(p => `
-      <div class="card mt-12">
-        <strong>${h(p.name || 'Property')}</strong> <span class="td-small">${h([p.city, p.state].filter(Boolean).join(', '))}</span>
-        <dl class="facts mt-12">
-          <div><dt>Beds</dt><dd>${p.beds.total} total · ${p.beds.occupied} occupied · ${p.beds.available} free</dd></div>
-          <div><dt>Guests staying now</dt><dd>${p.guests.staying_now}</dd></div>
-          <div><dt>Guests (all time)</dt><dd>${p.guests.all_time}</dd></div>
-          <div><dt>Check-ins, last 30 days</dt><dd>${p.guests.checked_in_last_30_days}</dd></div>
-          <div><dt>Payments recorded, last 30 days</dt><dd>${p.payments_recorded_last_30_days}</dd></div>
-          <div><dt>Last activity</dt><dd>${p.last_activity_at ? fmtDate(p.last_activity_at) : '—'}</dd></div>
-          <div><dt>Address added</dt><dd>${yes(p.setup.address_added)}</dd></div>
-          <div><dt>GST</dt><dd>${p.setup.gst_on ? 'On' : 'Off'}${p.setup.gstin_added ? ' · GSTIN added' : ''}</dd></div>
-          <div><dt>UPI / bank added</dt><dd>${yes(p.setup.payment_details_added)}</dd></div>
-        </dl>
-      </div>`).join('') || '<p class="td-small mt-12">No property yet.</p>';
-    const roles = Object.entries(a.staff.by_role || {}).map(([r, c]) => `${c} ${roleName[r] || r}`).join(' · ') || '—';
-    openModal(a.business_name || 'Account', `
-      <dl class="facts">
-        <div><dt>Status</dt><dd>${h(statusText)}</dd></div>
-        <div><dt>Trial ends</dt><dd>${fmtDate(a.trial_ends_at)}</dd></div>
-        <div><dt>Joined</dt><dd>${fmtDate(a.created_at)}</dd></div>
-        <div><dt>Owner</dt><dd>${h(a.owner.name || '—')}</dd></div>
-        <div><dt>Owner mobile</dt><dd>${h(a.owner.mobile || '—')}</dd></div>
-        <div><dt>Owner email</dt><dd>${h(a.owner.email || '—')}</dd></div>
-        <div><dt>Logins</dt><dd>${h(roles)}${a.staff.inactive ? ` · ${a.staff.inactive} switched off` : ''}</dd></div>
-        ${a.suspension_reason ? `<div><dt>Suspended because</dt><dd>${h(a.suspension_reason)}</dd></div>` : ''}
-      </dl>
-      ${props}
-      <p class="td-small mt-12">🔒 ${h(a.hidden)}</p>
-      <div class="btn-group mt-12"><button class="btn btn-outline" onclick="closeModal()">Close</button></div>`, { wide: true });
-  } catch (ex) { toast(ex.message, 'error'); }
-}
-
-async function adminActivate(id) {
-  if (!confirm('Activate this account? Trial will be extended 30 days from today.')) return;
-  try {
-    await api('PATCH', `/admin/accounts/${id}/activate`);
-    toast('Account activated', 'success');
-    renderPage('admin');
-  } catch(ex) { toast(ex.message, 'error'); }
-}
-
-function adminResetPassword(id, name) {
-  // autocapitalize/autocorrect off: phone keyboards otherwise turn "owner123"
-  // into "Owner123" or add a space, and the owner then gets "Invalid credentials".
-  openModal(`Reset password: ${name}`, `
-    <div class="field"><label for="arp-pass">New password for the owner</label>
-      <input id="arp-pass" type="text" placeholder="Min 8 characters" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="200" /></div>
-    <div class="field-note">Type it exactly as the owner should type it. Capital and small letters are different.</div>
-    <div id="arp-error" class="error-msg hidden"></div>
-    <div class="btn-group mt-12"><button class="btn btn-primary" id="arp-btn" onclick="submitAdminReset('${id}')">Set password</button>
-      <button class="btn btn-outline" onclick="closeModal()">Cancel</button></div>`);
-}
-async function submitAdminReset(id) {
-  const err = document.getElementById('arp-error'); err.classList.add('hidden');
-  const btn = document.getElementById('arp-btn');
-  const pwd = document.getElementById('arp-pass').value.trim();
-  if (pwd.length < 8) { err.textContent = 'Password must be at least 8 characters'; err.classList.remove('hidden'); return; }
-  if (btn) btn.disabled = true;
-  try {
-    const r = await api('POST', `/admin/accounts/${id}/reset-password`, { new_password: pwd });
-    const l = r.login || {};
-    // Show exactly what the owner must type, so nothing is lost in a message.
-    openModal('✅ Password changed', `
-      <p>Send these sign-in details to <b>${h(l.name || 'the owner')}</b>:</p>
-      <div class="card" style="margin:12px 0">
-        ${l.mobile ? `<div>Mobile: <b>${h(l.mobile)}</b></div>` : ''}
-        ${l.email ? `<div>or Email: <b>${h(l.email)}</b></div>` : ''}
-        <div class="mt-8">Password: <b style="font-family:monospace;font-size:17px">${h(r.password || pwd)}</b></div>
-      </div>
-      <p class="td-small">They are signed out on other phones and must sign in again with this password. Any "too many wrong tries" lock is removed.</p>
-      <div class="btn-group mt-12"><button class="btn btn-primary" onclick="closeModal()">Done</button></div>`);
-  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); if (btn) btn.disabled = false; }
-}
-
-async function adminSuspend(id) {
-  const reason = prompt('Reason for suspension (optional):') ?? '';
-  try {
-    await api('PATCH', `/admin/accounts/${id}/suspend`, { reason });
-    toast('Account suspended', 'warning');
-    renderPage('admin');
-  } catch(ex) { toast(ex.message, 'error'); }
-}
-
-// ── Staff login code (first sign-in / forgot MPIN) ─────────────
-function adminDeleteUser(id, name, business) {
-  openModal(`Delete user: ${name}`, `
-    <div class="warn-banner">⚠️ This permanently deletes the owner account <b>${h(name)}</b> (${h(business)}) and all their data. This cannot be undone.</div>
-    <div class="field mt-12"><label for="adel-confirm">Type <b>DELETE</b> to confirm</label><input id="adel-confirm" placeholder="DELETE" autocomplete="off" /></div>
-    <div id="adel-error" class="error-msg hidden"></div>
-    <div class="btn-group mt-12">
-      <button class="btn btn-danger" onclick="submitAdminDelete('${h(id)}')">Permanently delete</button>
-      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
-    </div>`);
-}
-
-async function submitAdminDelete(id) {
-  const err = document.getElementById('adel-error'); err.classList.add('hidden');
-  if (document.getElementById('adel-confirm')?.value !== 'DELETE') {
-    err.textContent = 'Type DELETE in capitals to confirm.'; err.classList.remove('hidden'); return;
-  }
-  try {
-    await api('DELETE', `/admin/accounts/${id}`);
-    toast('Account and all data permanently deleted', 'warning', 5000);
-    closeModal(); renderPage('admin');
-  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
-}
-
 // ── Staff login code (first sign-in / forgot MPIN) ─────────────
 function showLoginCode(c, justAdded) {
   const site = location.origin;
@@ -3081,16 +2955,6 @@ function showMpinScreen() {
   document.getElementById('mp-info').classList.add('hidden');
   showScreen('mpin-screen');
 }
-async function requestMpinCode() {
-  const info = document.getElementById('mp-info'), err = document.getElementById('mp-error');
-  err.classList.add('hidden');
-  const mobile = document.getElementById('mp-mobile').value.replace(/\D/g, '').slice(-10);
-  if (mobile.length !== 10) { err.textContent = 'Type your 10-digit mobile number first'; err.classList.remove('hidden'); return; }
-  try {
-    const r = await api('POST', '/auth/staff/request-code', { mobile });
-    info.textContent = r.message; info.classList.remove('hidden');
-  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
-}
 async function submitMpinSetup() {
   const err = document.getElementById('mp-error'); err.classList.add('hidden');
   const btn = document.getElementById('mp-save');
@@ -3113,13 +2977,144 @@ async function submitMpinSetup() {
 function startSession(data) {
   STATE.token = data.token;
   STATE.user = data.user;
-  sessionStorage.setItem('db_token', data.token);
-  sessionStorage.setItem('db_user', JSON.stringify(data.user));
+  SESSION.set('db_token', data.token);
+  SESSION.set('db_user', JSON.stringify(data.user));
+  hideBlocked();
   showApp();
 }
+// ── Plans, trial banner, "Get started" checklist, blocked-account help ─────────
+/** WhatsApp / phone / email of DormBook support (set in the super-admin panel), as buttons. */
+function supportButtons(text) {
+  const c = window.APP_CONFIG || {};
+  const s = c.support || {};
+  const out = [];
+  if (s.whatsapp) out.push(`<a class="btn btn-whatsapp" href="https://wa.me/${h(s.whatsapp)}?text=${encodeURIComponent(text || 'Hello, I need help with DormBook')}" target="_blank" rel="noopener">🟢 WhatsApp us</a>`);
+  if (s.phone) out.push(`<a class="btn btn-outline" href="tel:${h(s.phone)}">📞 ${h(s.phone)}</a>`);
+  if (s.email) out.push(`<a class="btn btn-outline" href="mailto:${h(s.email)}">✉️ ${h(s.email)}</a>`);
+  return out.join('');
+}
+function plansHtml(business) {
+  const plans = ((window.APP_CONFIG || {}).plans) || [];
+  if (!plans.length) return '<p class="td-small">Contact us for pricing.</p>';
+  return `<div class="plan-list">${plans.map(p => `
+    <div class="plan-card">
+      <div class="plan-name">${h(p.name)}</div>
+      <div class="plan-price">${rupees(p.price_paise).replace(/\.00$/, '')}<span> / ${p.duration_days} days</span></div>
+      ${p.description ? `<div class="td-small">${h(p.description)}</div>` : ''}
+      ${p.max_beds ? `<div class="td-small">Up to ${p.max_beds} beds</div>` : ''}
+      ${(window.APP_CONFIG && APP_CONFIG.support && APP_CONFIG.support.whatsapp) ? `<a class="btn btn-primary btn-sm mt-8" target="_blank" rel="noopener"
+        href="https://wa.me/${h(APP_CONFIG.support.whatsapp)}?text=${encodeURIComponent(`Hello, I want the ${p.name} plan for ${business || 'my PG'}.`)}">Choose ${h(p.name)}</a>` : ''}
+    </div>`).join('')}</div>`;
+}
+async function showPlans() {
+  await loadAppConfig();
+  const acc = (STATE.user && STATE.user.account) || {};
+  openModal('Plans', `
+    <p class="td-small mb-12">Pick a plan and send us a message — we confirm your payment and your account continues without any break. All your data stays as it is.</p>
+    ${plansHtml(acc.business_name)}
+    <div class="btn-group mt-12">${supportButtons(`Hello, I want to renew DormBook for ${acc.business_name || 'my PG'}.`)}</div>`, { wide: true });
+}
+function showBlocked(message) {
+  const box = document.getElementById('login-blocked');
+  if (!box) { toast(message, 'error', 7000); return; }
+  loadAppConfig().then(() => {
+    box.innerHTML = `<div class="blocked-title">⛔ ${h(message || 'This account is paused.')}</div>
+      <p class="td-small">Your data is safe. Choose a plan or contact us to continue.</p>
+      ${plansHtml('')}
+      <div class="btn-group mt-12">${supportButtons('Hello, my DormBook account is paused. Please help me continue.')}</div>`;
+    box.classList.remove('hidden');
+  });
+}
+function hideBlocked() { document.getElementById('login-blocked')?.classList.add('hidden'); }
+
+function planBanner(a) {
+  if (!a) return '';
+  const d = a.days_left;
+  if (a.status === 'trial' && d !== null && d !== undefined) {
+    const urgent = d <= 7;
+    return `<div class="plan-banner ${urgent ? 'warn' : ''}"><div><b>Free trial · ${d <= 0 ? 'ends today' : `${d} day${d === 1 ? '' : 's'} left`}</b>
+      <div class="td-small">${urgent ? 'Choose a plan now so your PG keeps running without a break.' : `Ends ${fmtDate(a.trial_ends_at)}. All features are on.`}</div></div>
+      <button class="btn ${urgent ? 'btn-primary' : 'btn-outline'} btn-sm" onclick="showPlans()">See plans</button></div>`;
+  }
+  if (a.status === 'grace') {
+    return `<div class="plan-banner bad"><div><b>Payment due</b><div class="td-small">Your plan ended ${fmtDate(a.paid_until)}. Renew now to avoid the app stopping.</div></div>
+      <button class="btn btn-primary btn-sm" onclick="showPlans()">Renew</button></div>`;
+  }
+  if (a.status === 'active' && d !== null && d !== undefined && d <= 7) {
+    return `<div class="plan-banner warn"><div><b>${h(a.plan_name || 'Plan')} renews in ${d} day${d === 1 ? '' : 's'}</b><div class="td-small">Paid until ${fmtDate(a.paid_until)}.</div></div>
+      <button class="btn btn-primary btn-sm" onclick="showPlans()">Renew</button></div>`;
+  }
+  return '';
+}
+
+const SETUP_STEPS = [
+  { key: 'beds', title: 'Add your beds', sub: 'Floors, rooms and beds — takes a minute', page: 'beds', btn: 'Add beds' },
+  { key: 'business_details', title: 'Add address & phone', sub: 'Printed on every bill', page: 'settings', btn: 'Add details' },
+  { key: 'payment_details', title: 'Add your UPI QR or bank', sub: 'Guests scan and pay from the bill', page: 'account', btn: 'Add UPI' },
+  { key: 'first_guest', title: 'Check in your first guest', sub: 'Rent and dues start counting by themselves', page: 'checkin', btn: 'Check in' },
+  { key: 'staff', title: 'Add a staff login', sub: 'Optional — reception signs in with mobile + MPIN', page: 'staff', btn: 'Add staff', optional: true },
+];
+async function fillDashExtra() {
+  const box = document.getElementById('dash-extra');
+  if (!box || !STATE.user || STATE.user.role !== 'owner') return;
+  let html = planBanner(STATE.user.account);
+  let dismissed = false;
+  try { dismissed = localStorage.getItem(`db_setup_done_${STATE.user.id}`) === '1'; } catch (_) { /* ignore */ }
+  if (!dismissed) {
+    const o = await api('GET', '/onboarding').catch(() => null);
+    if (o) {
+      const need = SETUP_STEPS.filter(x => !x.optional);
+      const doneCount = SETUP_STEPS.filter(x => o[x.key]).length;
+      if (need.every(x => o[x.key])) {
+        try { localStorage.setItem(`db_setup_done_${STATE.user.id}`, '1'); } catch (_) { /* ignore */ }
+      } else {
+        html += `<div class="card setup-card mb-20">
+          <div class="setup-head"><strong>Get started</strong><span class="td-small">${doneCount} of ${SETUP_STEPS.length} done</span>
+            <button class="btn btn-ghost btn-sm" onclick="hideSetup()" aria-label="Hide this checklist">Hide</button></div>
+          <div class="setup-bar"><i style="width:${Math.round(doneCount * 100 / SETUP_STEPS.length)}%"></i></div>
+          ${SETUP_STEPS.map(x => `<div class="setup-row ${o[x.key] ? 'done' : ''}">
+            <span class="setup-tick" aria-hidden="true">${o[x.key] ? '✓' : ''}</span>
+            <div class="setup-txt"><div>${h(x.title)}</div><div class="td-small">${h(x.sub)}</div></div>
+            ${o[x.key] ? '' : `<button class="btn ${x.optional ? 'btn-outline' : 'btn-primary'} btn-sm" onclick="navigate('${x.page}')">${h(x.btn)}</button>`}
+          </div>`).join('')}
+        </div>`;
+      }
+    }
+  }
+  const still = document.getElementById('dash-extra');
+  if (still) still.innerHTML = html;
+}
+function hideSetup() {
+  try { localStorage.setItem(`db_setup_done_${STATE.user.id}`, '1'); } catch (_) { /* ignore */ }
+  document.querySelector('.setup-card')?.remove();
+}
+
+/** 👁 Show / hide the password while typing (phones make typos easy). */
+function bindPasswordToggles() {
+  document.querySelectorAll('input[type=password][data-toggle]').forEach(inp => {
+    if (inp.dataset.bound) return;
+    inp.dataset.bound = '1';
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'pw-eye'; b.textContent = 'Show'; b.setAttribute('aria-label', 'Show password');
+    b.addEventListener('click', () => {
+      const show = inp.type === 'password';
+      inp.type = show ? 'text' : 'password';
+      b.textContent = show ? 'Hide' : 'Show';
+      b.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    });
+    inp.parentNode.classList.add('pw-wrap');
+    inp.after(b);
+  });
+}
+document.addEventListener('DOMContentLoaded', () => {
+  bindPasswordToggles();
+  const keep = document.getElementById('login-keep');
+  if (keep) keep.checked = SESSION.keep() || IS_APP_UI;
+});
+
 function setToken(token) {
   STATE.token = token;
-  sessionStorage.setItem('db_token', token);
+  SESSION.set('db_token', token);
 }
 
 // ── Bill: send on WhatsApp + pay block (UPI QR, bank) ───────────
@@ -3162,11 +3157,34 @@ function payBlock(pay, balance, c = {}) {
 }
 
 // ── My Account ─────────────────────────────────────────────────
+/** Help & support (set by the DormBook team in the super-admin panel). */
+async function fillHelpCard() {
+  const box = document.getElementById('acc-help');
+  if (!box) return;
+  const c = await loadAppConfig();
+  if (!c || !document.getElementById('acc-help')) return;
+  const s = c.support || {}, faq = c.faq || [];
+  const name = (c.branding && c.branding.app_name) || 'DormBook';
+  const links = [];
+  if (s.whatsapp) links.push(`<a class="btn btn-whatsapp btn-sm" href="https://wa.me/${h(s.whatsapp)}" target="_blank" rel="noopener">🟢 WhatsApp</a>`);
+  if (s.phone) links.push(`<a class="btn btn-outline btn-sm" href="tel:${h(s.phone)}">📞 ${h(s.phone)}</a>`);
+  if (s.email) links.push(`<a class="btn btn-outline btn-sm" href="mailto:${h(s.email)}">✉️ ${h(s.email)}</a>`);
+  if (!links.length && !faq.length) { box.innerHTML = ''; return; }
+  if (box.parentNode) box.parentNode.appendChild(box);   // help goes below your own details
+  box.innerHTML = `<div class="card mb-20"><strong>Help & support</strong>
+    ${s.message ? `<p class="td-small mt-4">${h(s.message)}</p>` : ''}
+    ${links.length ? `<div class="btn-group mt-12">${links.join('')}</div>${s.hours ? `<div class="td-small mt-8">${h(s.hours)}</div>` : ''}` : ''}
+    ${faq.length ? `<div class="faq mt-12">${faq.map(x => `<details><summary>${h(x.q)}</summary><p>${h(x.a)}</p></details>`).join('')}</div>` : ''}
+    <div class="td-small mt-8">${h(name)}</div></div>`;
+}
+
 async function renderAccount(el) {
   const u = STATE.user;
   const isStaff = u.role === 'manager' || u.role === 'reception';
   const pay = can('settings') ? await api('GET', '/account/payment') : null;
+  setTimeout(fillHelpCard, 0);   // fills #acc-help once the page below is on screen
   el.innerHTML = `
+    <div id="acc-help"></div>
     <div class="card mb-20">
       <strong>You</strong>
       <dl class="facts mt-12">
