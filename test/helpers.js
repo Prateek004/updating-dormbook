@@ -3,11 +3,11 @@
 const { spawn } = require('child_process');
 const path = require('path');
 
-async function boot({ dbDir, port }) {
+async function boot({ dbDir, port, env = {} }) {
   const logs = [];
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'server.js')], {
     env: { ...process.env, DB_DIR: dbDir, PORT: String(port), DISABLE_SCHEDULER: 'true', NODE_ENV: 'test',
-      JWT_SECRET: 'test_secret_that_is_long_enough_123', SUPERADMIN_PASSWORD: 'Sup3r!secret' },
+      JWT_SECRET: 'test_secret_that_is_long_enough_123', SUPERADMIN_PASSWORD: 'Sup3r!secret', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (d) => logs.push(String(d)));
@@ -26,7 +26,12 @@ async function boot({ dbDir, port }) {
     let json; try { json = JSON.parse(text); } catch (_) { json = text; }
     return { status: res.status, body: json };
   };
-  return { child, logs, call, port, token: () => token, setToken: (t) => { token = t; }, stop: () => child.kill() };
+  const stop = () => new Promise((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    child.once('exit', () => resolve());
+    child.kill();
+  });
+  return { child, logs, call, port, base, token: () => token, setToken: (t) => { token = t; }, stop };
 }
 
 module.exports = { boot };
