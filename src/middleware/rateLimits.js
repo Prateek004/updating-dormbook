@@ -8,6 +8,9 @@
  *   Guest bill links /b/…        per IP                   RL_BILL_LINK_MAX / RL_PUBLIC_WINDOW_SEC       (30 / 60 s)
  *   Signed-in users (loose)      per user                 RL_USER_MAX / RL_USER_WINDOW_SEC              (600 / 60 s)
  *   Flood guard, whole API       per IP                   RL_IP_FLOOD_MAX / RL_USER_WINDOW_SEC          (3000 / 60 s)
+ *   Super-admin changes          per user                 RL_ADMIN_WRITE_MAX / 60 s                     (120 / min)
+ *   Super-admin CSV exports      per user                 RL_ADMIN_EXPORT_MAX / 10 min                  (30 / 10 min)
+ *   Live-update connections      per IP                   RL_LIVE_MAX / 60 s                            (60 / min)
  *
  * Per-account wrong password / MPIN: exponential back-off, not a hard lock-out.
  *   First AUTH_FREE_TRIES (5) wrong tries cost nothing; then the wait is
@@ -37,6 +40,9 @@ const CFG = Object.freeze({
   userMax:          num('RL_USER_MAX', 600),
   userWindowMs:     num('RL_USER_WINDOW_SEC', 60) * 1000,
   ipFloodMax:       num('RL_IP_FLOOD_MAX', 3000),
+  adminWriteMax:    num('RL_ADMIN_WRITE_MAX', 120),
+  adminExportMax:   num('RL_ADMIN_EXPORT_MAX', 30),
+  liveMax:          num('RL_LIVE_MAX', 60),
   freeTries:        num('AUTH_FREE_TRIES', 5, 1, 100),
   backoffBaseSec:   num('AUTH_BACKOFF_BASE_SEC', 30, 1, 3600),
   backoffMaxMin:    num('AUTH_BACKOFF_MAX_MIN', 15, 1, 24 * 60),
@@ -111,6 +117,22 @@ const publicIp = make({
   message: json('Too many requests. Please wait a minute.'),
 });
 
+const adminWrite = make({
+  windowMs: 60 * 1000, max: CFG.adminWriteMax,
+  keyGenerator: (req) => `aw:${(req.user && req.user.id) || tokenUser(req) || req.ip}`,
+  message: json('Too many changes in a minute. Please wait a moment.'),
+});
+const adminExport = make({
+  windowMs: 10 * 60 * 1000, max: CFG.adminExportMax,
+  keyGenerator: (req) => `ax:${(req.user && req.user.id) || tokenUser(req) || req.ip}`,
+  message: json('Too many downloads. Please wait a few minutes.'),
+});
+// The live stream itself is one long request; reconnects are counted per IP.
+const liveConnect = make({
+  windowMs: 60 * 1000, max: CFG.liveMax,
+  message: json('Too many live-update connections. Please wait a minute.'),
+});
+
 const billLink = make({
   windowMs: CFG.publicWindowMs, max: CFG.billLinkMax,
   message: 'Too many requests. Please wait a minute.',
@@ -125,7 +147,8 @@ function applyRateLimits(app) {
   // Codes cost money (SMS) and can be used to pester someone: also limited per mobile number.
   app.use('/api/v1/auth/forgot-password', codePerMobile);
   app.use('/api/v1/auth/staff/request-code', codePerMobile);
+  app.use('/api/v1/events', liveConnect);
   app.use('/api/', publicIp, perUser);
 }
 
-module.exports = { CFG, backoffSeconds, waitText, applyRateLimits, billLink };
+module.exports = { CFG, backoffSeconds, waitText, applyRateLimits, billLink, adminWrite, adminExport };
