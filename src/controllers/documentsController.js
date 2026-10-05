@@ -11,6 +11,7 @@ const { v4: uuidv4 } = require('uuid');
 const { getDb } = require('../db/connection');
 const { encryptBuffer, decryptBuffer } = require('../services/encryption');
 const { writeAudit, logDocumentAccess } = require('../middleware/auditLog');
+const offsite = require('../services/offsite');
 
 const DOC_TYPES = ['id_front', 'id_back', 'photo', 'other'];
 const MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'application/pdf': 'pdf' };
@@ -30,6 +31,38 @@ function sniffType(buf) {
   if (buf.subarray(0, 4).toString('latin1') === 'RIFF' && buf.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
   if (buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
   return null;
+}
+
+/**
+ * Where a stored file is on THIS server. Rows keep the full path from the server that saved it
+ * (e.g. /data/uploads/… on Railway). After moving to a disk with another mount path
+ * (e.g. /var/data on Render) the same file lives under the new uploads folder. Returns null
+ * for anything that would leave the uploads folder.
+ */
+function localPath(stored) {
+  if (insideUploads(stored)) return path.resolve(String(stored));
+  const p = String(stored || '').replace(/\\/g, '/');
+  const i = p.lastIndexOf('/uploads/');
+  if (i < 0) return null;
+  const rest = p.slice(i + '/uploads/'.length);
+  if (!rest || rest.split('/').some((seg) => !seg || seg === '..' || seg === '.')) return null;
+  const candidate = path.resolve(uploadRoot(), ...rest.split('/'));
+  return insideUploads(candidate) ? candidate : null;
+}
+
+/** R2 name of a stored file: uploads/<property>/<resident>/<file> (same layout as on the disk). */
+function r2KeyFor(file) {
+  const rel = path.relative(uploadRoot(), path.resolve(String(file || '')));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return `uploads/${rel.split(path.sep).join('/')}`;
+}
+
+/** Off-site copy of an (already encrypted) file. Never waits, never throws. */
+function mirrorToR2(file, encrypted) {
+  const key = r2KeyFor(file);
+  if (!key || !offsite.isConfigured()) return;
+  offsite.putObject(key, encrypted).then((r) => { if (r.error) console.error('[DOCS] off-site copy problem:', r.error); })
+    .catch((e) => console.error('[DOCS] off-site copy failed:', e.message));
 }
 
 /** A stored path is used only if it is inside the uploads folder (never follow a path out of it). */
@@ -61,7 +94,8 @@ function uploadDocument(req, res) {
   const dir = path.join(uploadRoot(), propertyId.replace(/[^a-zA-Z0-9-]/g, ''), resident.id.replace(/[^a-zA-Z0-9-]/g, ''));
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${id}.${MIME[m[1]]}.enc`);
-  fs.writeFileSync(file, encryptBuffer(buf), { mode: 0o600 });
+  const encrypted = encryptBuffer(buf);
+  fs.writeFileSync(file, encrypted, { mode: 0o600 });
   try {
     db.prepare(`INSERT INTO resident_documents (id, resident_id, property_id, doc_type, mime_type, size_bytes, file_path, uploaded_by, created_at)
       VALUES (?,?,?,?,?,?,?,?,?)`).run(id, resident.id, propertyId, docType, m[1], buf.length, file, req.user.id, new Date().toISOString());
@@ -71,6 +105,7 @@ function uploadDocument(req, res) {
   }
   writeAudit({ propertyId, userId: req.user.id, action: 'ID_DOCUMENT_UPLOADED', entityType: 'residents',
     entityId: resident.id, snapshot: { doc_type: docType, size: buf.length }, ip: req.ip });
+  mirrorToR2(file, encrypted);
   return res.status(201).json({ id, doc_type: docType, mime_type: m[1], size_bytes: buf.length });
 }
 
@@ -81,15 +116,26 @@ function listDocuments(req, res) {
   return res.json(rows);
 }
 
-function getDocument(req, res) {
+async function getDocument(req, res) {
   const db = getDb();
   const doc = db.prepare('SELECT * FROM resident_documents WHERE id = ? AND resident_id = ? AND property_id = ?')
     .get(req.params.docId, req.params.id, req.user.property_id);
   if (!doc) return res.status(404).json({ error: 'Document not found' });
   let data;
   try {
-    if (!insideUploads(doc.file_path)) throw new Error('stored path is outside the uploads folder');
-    data = decryptBuffer(fs.readFileSync(doc.file_path));
+    const file = localPath(doc.file_path);
+    if (!file) throw new Error('stored path is outside the uploads folder');
+    let stored;
+    try { stored = fs.readFileSync(file); }
+    catch (e) {
+      // Not on this disk (new server / lost disk): fetch the off-site copy from R2 and keep it locally again.
+      const key = e.code === 'ENOENT' ? r2KeyFor(file) : null;
+      stored = key ? await offsite.getObject(key) : null;
+      if (!stored) throw e;
+      try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, stored, { mode: 0o600 }); }
+      catch (_) { /* serving it still works */ }
+    }
+    data = decryptBuffer(stored);
   } catch (e) {
     console.error('[DOCS] cannot read', doc.id, e.message);
     return res.status(410).json({ error: 'This file is no longer available on the server' });
@@ -112,10 +158,40 @@ function deleteDocument(req, res) {
     .get(req.params.docId, req.params.id, req.user.property_id);
   if (!doc) return res.status(404).json({ error: 'Document not found' });
   db.prepare('DELETE FROM resident_documents WHERE id = ?').run(doc.id);
-  if (insideUploads(doc.file_path)) fs.rmSync(doc.file_path, { force: true });
+  const file = localPath(doc.file_path);
+  if (file) {
+    fs.rmSync(file, { force: true });
+    const key = r2KeyFor(file);
+    if (key && offsite.isConfigured()) offsite.deleteObject(key).catch(() => {});
+  }
   writeAudit({ propertyId: req.user.property_id, userId: req.user.id, action: 'ID_DOCUMENT_DELETED', entityType: 'residents',
     entityId: doc.resident_id, snapshot: { doc_type: doc.doc_type }, ip: req.ip });
   return res.json({ message: 'Document deleted' });
 }
 
-module.exports = { uploadDocument, listDocuments, getDocument, deleteDocument, DOC_TYPES, sniffType };
+/** Admin → System: copy every ID file that is not off-site yet (each place checked). Returns { checked, uploaded, failed }. */
+async function syncUploadsToR2() {
+  const out = { checked: 0, uploaded: 0, failed: 0 };
+  const list = offsite.stores();
+  if (!list.length) return { ...out, skipped: true };
+  const root = uploadRoot();
+  if (!fs.existsSync(root)) return out;
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) =>
+    d.isDirectory() ? walk(path.join(dir, d.name)) : (d.name.endsWith('.enc') ? [path.join(dir, d.name)] : []));
+  const files = walk(root);
+  out.checked = files.length;
+  for (const st of list) {
+    let have;
+    try { have = new Set((await st.list('uploads/', { maxPages: 200 })).map((o) => o.key)); }
+    catch (e) { console.error(`[DOCS] ${st.name} list failed:`, e.message); out.failed += files.length; continue; }
+    for (const file of files) {
+      const key = r2KeyFor(file);
+      if (!key || have.has(key)) continue;
+      const r = await st.put(key, fs.readFileSync(file));
+      if (r.ok) out.uploaded++; else out.failed++;
+    }
+  }
+  return out;
+}
+
+module.exports = { uploadDocument, listDocuments, getDocument, deleteDocument, DOC_TYPES, sniffType, syncUploadsToR2, r2KeyFor };
