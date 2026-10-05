@@ -1,0 +1,71 @@
+# DormBook on Render (Blueprint). Render → New → Blueprint → pick this repo.
+# Values marked "sync: false" are asked for when you create the Blueprint (type them in Render,
+# never in this file). Full steps: README.md → "Deploy on Render".
+services:
+  - type: web
+    name: dormbook
+    runtime: node
+    # A persistent disk needs a paid instance (Starter or above). The free plan has no disk:
+    # every deploy would wipe all accounts and guests, so the app refuses to start there.
+    plan: starter
+    region: singapore            # closest Render region to India
+    buildCommand: npm ci --omit=dev || npm install --omit=dev
+    startCommand: node src/server.js
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    disk:
+      name: dormbook-data
+      mountPath: /var/data
+      sizeGB: 1                  # can be increased later (never decreased)
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DB_DIR
+        value: /var/data
+      - key: APP_TZ
+        value: Asia/Kolkata
+      - key: JWT_SECRET
+        generateValue: true
+      # 64 hex characters. MOVING EXISTING DATA? Use the SAME value as your old server, or saved
+      # ID numbers / bank details cannot be read. New install: run `openssl rand -hex 32`.
+      - key: AES_256_KEY
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: SUPERADMIN_EMAIL
+        sync: false
+      - key: SUPERADMIN_PASSWORD
+        sync: false
+      - key: SUPERADMIN_MOBILE
+        sync: false
+      # Cloudflare R2 (off-site backups + ID-proof copies)
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PREFIX
+        value: dormbook
+      # Supabase Storage (second off-site copy, S3 protocol). Dashboard → Storage → S3 Connection.
+      - key: SUPABASE_URL
+        value: https://uqwzpodpnegzejhqdtta.supabase.co
+      - key: SUPABASE_S3_ACCESS_KEY_ID
+        sync: false
+      - key: SUPABASE_S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: SUPABASE_S3_REGION
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: dormbook-backups
+      # OTP / SMS codes are switched off for now (set to true to bring them back)
+      - key: OTP_ENABLED
+        value: "false"
+      - key: SUBSCRIPTION_GRACE_DAYS
+        value: "7"
