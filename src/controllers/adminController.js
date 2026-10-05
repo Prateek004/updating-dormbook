@@ -1,6 +1,18 @@
 'use strict';
 
 const { getDb } = require('../db/connection');
+const { accountState } = require('../services/accountStatus');
+const realtime = require('../services/realtime');
+
+/** Super-admin action log (admin_audit). Never blocks the action itself. */
+function log(req, action, id, details) {
+  try { require('./superadminController').log(req, action, 'account', id, details); } catch (_) { /* ignore */ }
+}
+/** Sign every login of this business out of the live-update stream (their next request is refused anyway). */
+function signOutAccount(db, accountId) {
+  try { for (const u of db.prepare('SELECT id FROM users WHERE account_id = ?').all(accountId)) realtime.userSignedOut(u.id); }
+  catch (_) { /* ignore */ }
+}
 
 function adminStats(req, res) {
   const db = getDb();
@@ -20,7 +32,9 @@ function listAccounts(req, res) {
   const db = getDb();
   const accounts = db.prepare(`
     SELECT a.id, a.business_name, a.plan, a.trial_ends_at, a.suspended_at, a.suspension_reason,
-           a.created_at,
+           a.created_at, a.paid_until, a.plan_id, a.admin_notes,
+           (SELECT name FROM saas_plans sp WHERE sp.id = a.plan_id) AS plan_name,
+           (SELECT o.email FROM users o WHERE o.account_id = a.id AND o.role = 'owner' ORDER BY o.created_at LIMIT 1) AS owner_email,
            COUNT(DISTINCT p.id)  AS properties,
            COUNT(DISTINCT r.id)  AS residents,
            COUNT(DISTINCT u.id)  AS users,
@@ -33,7 +47,8 @@ function listAccounts(req, res) {
     GROUP BY a.id
     ORDER BY a.created_at DESC
   `).all();
-  res.json(accounts);
+  // status / days_left: the same rule sign-in uses (trial, trial_expired, active, grace, expired, suspended)
+  res.json(accounts.map((a) => { const st = accountState(a); return { ...a, status: st.status, days_left: st.days_left }; }));
 }
 
 /**
@@ -43,7 +58,7 @@ function listAccounts(req, res) {
  */
 function getAccount(req, res) {
   const db = getDb();
-  const a = db.prepare('SELECT id, business_name, plan, trial_ends_at, suspended_at, suspension_reason, created_at FROM accounts WHERE id = ?')
+  const a = db.prepare('SELECT id, business_name, plan, trial_ends_at, suspended_at, suspension_reason, created_at, paid_until, plan_id, admin_notes FROM accounts WHERE id = ?')
     .get(req.params.id);
   if (!a) return res.status(404).json({ error: 'Account not found' });
   const has = tableHas(db);
@@ -83,11 +98,15 @@ function getAccount(req, res) {
     };
   });
 
-  const status = a.suspended_at ? 'suspended'
-    : (a.plan === 'trial' && a.trial_ends_at && a.trial_ends_at < now ? 'trial_expired' : a.plan);
+  const st = accountState(a);
+  const status = st.status;
   return res.json({
     id: a.id, business_name: a.business_name, plan: a.plan, status,
-    trial_ends_at: a.trial_ends_at, created_at: a.created_at,
+    trial_ends_at: a.trial_ends_at, created_at: a.created_at, days_left: st.days_left,
+    paid_until: a.paid_until, plan_id: a.plan_id, admin_notes: a.admin_notes,
+    plan_name: (one('SELECT name FROM saas_plans WHERE id = ?', a.plan_id || '') || {}).name || null,
+    subscription_payments: db.prepare(`SELECT id, invoice_no, amount_paise, mode, paid_on, period_start, period_end, status
+      FROM subscription_payments WHERE account_id = ? ORDER BY paid_on DESC, created_at DESC LIMIT 20`).all(a.id),
     suspended_at: a.suspended_at, suspension_reason: a.suspension_reason,
     owner: { name: owner.name || '', mobile: owner.mobile || '', email: owner.email || '', since: owner.created_at || null },
     staff, properties: props,
@@ -113,9 +132,12 @@ function suspendAccount(req, res) {
   const account = db.prepare('SELECT id FROM accounts WHERE id = ?').get(req.params.id);
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
+  const why = typeof reason === 'string' ? reason.trim().slice(0, 300) : '';
   db.prepare(`
     UPDATE accounts SET suspended_at = datetime('now'), suspension_reason = ? WHERE id = ?
-  `).run(reason || null, req.params.id);
+  `).run(why || null, req.params.id);
+  signOutAccount(db, req.params.id);
+  log(req, 'ACCOUNT_SUSPENDED', req.params.id, { reason: why });
 
   res.json({ ok: true });
 }
@@ -128,12 +150,23 @@ function activateAccount(req, res) {
   db.prepare(`
     UPDATE accounts
     SET plan = 'trial',
-        trial_ends_at = datetime('now', '+30 days'),
+        trial_ends_at = ?,
         suspended_at = NULL,
         suspension_reason = NULL
     WHERE id = ?
-  `).run(req.params.id);
+  `).run(new Date(Date.now() + 30 * 86400000).toISOString(), req.params.id);   // ISO, same format sign-in compares with
+  log(req, 'ACCOUNT_REOPENED_TRIAL_30', req.params.id);
 
+  res.json({ ok: true });
+}
+
+/** PATCH /admin/accounts/:id/unsuspend — lift a suspension, keep the plan and dates as they are. */
+function unsuspendAccount(req, res) {
+  const db = getDb();
+  const account = db.prepare('SELECT id FROM accounts WHERE id = ?').get(req.params.id);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+  db.prepare('UPDATE accounts SET suspended_at = NULL, suspension_reason = NULL WHERE id = ?').run(req.params.id);
+  log(req, 'ACCOUNT_UNSUSPENDED', req.params.id);
   res.json({ ok: true });
 }
 
@@ -160,6 +193,8 @@ function resetOwnerPassword(req, res) {
   db.prepare("UPDATE users SET password_hash = ?, pwd_changed_at = ?, failed_logins = 0, locked_until = NULL, updated_at = datetime('now') WHERE id = ?")
     .run(bcrypt.hashSync(pwd, parseInt(process.env.BCRYPT_ROUNDS || '12', 10)), now, owner.id);
   console.log(`[SUPERADMIN] Owner password reset: account ${req.params.id} (user ${owner.id}) by ${req.user.id}`);
+  realtime.userSignedOut(owner.id);
+  log(req, 'OWNER_PASSWORD_RESET', req.params.id, { user_id: owner.id });
   res.json({
     ok: true,
     message: `Password reset for ${owner.name}`,
@@ -192,7 +227,9 @@ function deleteAccount(req, res) {
   const USERS = 'SELECT id FROM users WHERE account_id = @acc';
   const RESIDENTS = `SELECT id FROM residents WHERE property_id IN (${PROPS})`;
   const propertyIds = db.prepare(PROPS.replace('@acc', '?')).all(accId).map((p) => p.id);
-  const KEEP = new Set(['accounts', 'properties', 'users', 'ledger_meta']);
+  // subscription_payments stay: what this customer paid you remains in your revenue reports.
+  const KEEP = new Set(['accounts', 'properties', 'users', 'ledger_meta', 'subscription_payments', 'admin_audit', 'app_settings', 'saas_plans']);
+  signOutAccount(db, accId);
 
   let removedRows = 0;
   const run = (sql) => { removedRows += db.prepare(sql).run({ acc: accId }).changes; };
@@ -241,8 +278,19 @@ function deleteAccount(req, res) {
     }
   }
 
+  // Off-site copies of those ID files (R2 / Supabase), if set up. Never waits.
+  for (const st of require('../services/offsite').stores()) {
+    for (const pid of propertyIds) {
+      const safe = String(pid).replace(/[^a-zA-Z0-9-]/g, '');
+      if (!safe) continue;
+      st.list(`uploads/${safe}/`, { maxPages: 50 })
+        .then((list) => Promise.all(list.map((o) => st.del(o.key))))
+        .catch((e) => console.error(`[SUPERADMIN] ${st.name} clean-up for property`, pid, e.message));
+    }
+  }
   console.log(`[SUPERADMIN] Account deleted: ${account.id} (${removedRows} rows) by ${req.user.id}`);
+  log(req, 'ACCOUNT_DELETED', account.id, { business_name: account.business_name, rows: removedRows });
   res.json({ ok: true, message: `Account "${account.business_name}" permanently deleted.` });
 }
 
-module.exports = { adminStats, listAccounts, getAccount, suspendAccount, activateAccount, resetOwnerPassword, deleteAccount };
+module.exports = { adminStats, listAccounts, getAccount, suspendAccount, activateAccount, unsuspendAccount, resetOwnerPassword, deleteAccount };
