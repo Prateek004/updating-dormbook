@@ -90,7 +90,9 @@ jobs:
             echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > "$HOME/.android/debug.keystore"
             echo "Stable signing key installed."
           else
-            echo "::warning::DEBUG_KEYSTORE_BASE64 secret not set - APK signed with a one-off key; updates will need an uninstall first."
+            # Refuse to build: an APK signed with a one-off key can never be updated in place.
+            echo "::error::DEBUG_KEYSTORE_BASE64 secret is missing. Add it in Settings -> Secrets and variables -> Actions, then re-run."
+            exit 1
           fi
 
       - name: Make gradlew executable
